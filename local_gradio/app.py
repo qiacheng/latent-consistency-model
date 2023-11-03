@@ -9,7 +9,7 @@ import numpy as np
 import PIL.Image
 import torch
 
-from diffusers import DiffusionPipeline
+from diffusers import DiffusionPipeline, AutoencoderTiny
 import torch
 
 import os
@@ -19,11 +19,28 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import uuid
 
+
+from openvino.frontend.pytorch.torchdynamo import backend, compile 
+
+##hack eval_frame.py for windows support, could be removed after official windows support from pytorch
+def check_if_dynamo_supported():
+    import sys
+    # Skip checking for Windows support for the OpenVINO backend
+    if sys.version_info >= (3, 12):
+        raise RuntimeError("Python 3.12+ not yet supported for torch.compile")
+
+torch._dynamo.eval_frame.check_if_dynamo_supported = check_if_dynamo_supported
+
+# set torch compile OpenVINO envs
+os.environ["OPENVINO_TORCH_BACKEND_DEVICE"] = "GPU.1"
+os.environ["PYTORCH_TRACING_MODE"]="TORCHFX"
+os.environ["OPENVINO_TORCH_MODEL_CACHING"] = "1"
+
 DESCRIPTION = '''# Latent Consistency Model
 Distilled from [Dreamshaper v7](https://huggingface.co/Lykon/dreamshaper-7) fine-tune of [Stable Diffusion v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5) with only 4,000 training iterations (~32 A100 GPU Hours). [Project page](https://latent-consistency-models.github.io)
 '''
-if not torch.cuda.is_available():
-    DESCRIPTION += "\n<p>Running on CPU 🥶 This demo does not work on CPU.</p>"
+#if not torch.cuda.is_available():
+ #   DESCRIPTION += "\n<p>Running on CPU 🥶 This demo does not work on CPU.</p>"
 
 MAX_SEED = np.iinfo(np.int32).max
 CACHE_EXAMPLES = torch.cuda.is_available() and os.getenv("CACHE_EXAMPLES") == "1"
@@ -38,19 +55,23 @@ USE_TORCH_COMPILE = os.getenv("USE_TORCH_COMPILE") == "1"
       If you are using Linux & Windows with GPU, please set the device="cuda";
 """
 # device = "mps"    # MacOS
-device = "cuda"   # Linux & Windows
-
+# device = "cuda"   # Linux & Windows
+device = "cpu"  # for OpenVINO     
 
 """
    DTYPE Options:
       To reduce GPU memory you can set "DTYPE=torch.float16",
       but image quality might be compromised
 """
-DTYPE = torch.float16  # torch.float16 works as well, but pictures seem to be a bit worse
+DTYPE = torch.float32  # torch.float16 works as well, but pictures seem to be a bit worse
 
 
 pipe = DiffusionPipeline.from_pretrained("SimianLuo/LCM_Dreamshaper_v7", custom_pipeline="latent_consistency_txt2img", custom_revision="main")
-pipe.to(torch_device=device, torch_dtype=DTYPE)
+#pipe.to(torch_device=device, torch_dtype=torch.float16 if param_dtype == 'torch.float16' else torch.float32)
+pipe.unet = torch.compile(pipe.unet, backend="openvino")
+pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taesd", use_safetensors=True)
+pipe.vae.decode = torch.compile(pipe.vae.decode, backend="openvino")
+#pipe.to(torch_device=device, torch_dtype=DTYPE)
 
 
 def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
@@ -88,7 +109,8 @@ def generate(
 ) -> PIL.Image.Image:
     seed = randomize_seed_fn(seed, randomize_seed)
     torch.manual_seed(seed)
-    pipe.to(torch_device=device, torch_dtype=torch.float16 if param_dtype == 'torch.float16' else torch.float32)
+
+    
     start_time = time.time()
     result = pipe(
         prompt=prompt,
